@@ -28,7 +28,7 @@ from wechat import (
     add_friend_by_phone, ContactInfoMonitor, detect_wechat_process,
     send_message_simple, send_image_simple,
     RemarkModifier, get_group_members, get_all_group_members,
-    OpenProcess, CloseHandle, get_wechat_base,
+    OpenProcess, CloseHandle, get_wechat_base, detect_wechat_processes,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -1102,10 +1102,11 @@ class MessageMonitorManager:
 
 class SendMessageDialog(QDialog):
 
-    def __init__(self, friend_name, parent=None, wxid=None):
+    def __init__(self, friend_name, parent=None, wxid=None, pid=None):
         super().__init__(parent)
         self.friend_name = friend_name
         self.wxid = wxid
+        self.pid = pid
         self.setup_ui()
 
     def setup_ui(self):
@@ -1232,7 +1233,7 @@ class SendMessageDialog(QDialog):
 
         parent = self.parent()
         if parent and isinstance(parent, WeChatManagerApp):
-            success = parent.send_message_to_wxid(self.wxid, content)
+            success = parent.send_message_to_wxid(self.wxid, content, pid=self.pid)
             if success:
                 self.accept()
             else:
@@ -1261,7 +1262,7 @@ class SendMessageDialog(QDialog):
 
         parent = self.parent()
         if parent and isinstance(parent, WeChatManagerApp):
-            success = parent.send_image_to_wxid(self.wxid, p)
+            success = parent.send_image_to_wxid(self.wxid, p, pid=self.pid)
             if success:
                 self.accept()
             else:
@@ -1640,7 +1641,7 @@ class WeChatManagerApp(QMainWindow):
         # 采用全局基础样式，无需局部内联QSS
         add_friend_layout.addWidget(self.add_friend_status)
 
-        self.monitor = None
+        self.contact_monitors = {}
         self.is_running = False
         self.is_paused = False
         self.phone_queue = []
@@ -1654,6 +1655,17 @@ class WeChatManagerApp(QMainWindow):
         self.load_add_friend_data()
 
         QTimer.singleShot(500, self.start_monitoring)
+
+        # 初始化“添加好友场景”下拉框，确保 currentData() 不为 None
+        try:
+            self.scene_combo.clear()
+            # 常见场景：3=通过微信号/手机号，4=通讯录，14=群聊
+            self.scene_combo.addItem("通过微信号/手机号", "3")
+            self.scene_combo.addItem("通过通讯录", "4")
+            self.scene_combo.addItem("通过群聊", "14")
+            self.scene_combo.setCurrentIndex(0)
+        except Exception as e:
+            logging.warning(f"初始化场景下拉框失败: {e}")
 
     def _init_simple_add_friend_tab(self):
         layout = QVBoxLayout(self.add_friend_tab)
@@ -2153,7 +2165,12 @@ class WeChatManagerApp(QMainWindow):
 
             remark_modifier = RemarkModifier()
 
-            result = remark_modifier.modify_remark(wechat_pids[0], wxid, new_remark)
+            # 选择正确的微信进程：优先使用当前选中的账号 PID
+            selected_pid = getattr(self, 'current_account_pid', None)
+            if selected_pid not in (wechat_pids or []):
+                selected_pid = wechat_pids[0]
+
+            result = remark_modifier.modify_remark(selected_pid, wxid, new_remark)
 
             if result:
                 status_label.setText("备注修改成功！")
@@ -2162,10 +2179,11 @@ class WeChatManagerApp(QMainWindow):
                 wechat_info = SimpleWeChatInfo()
                 accounts = wechat_info.run()
                 if accounts:
-                    current_account = accounts[0]
+                    # 和修改时用到的 selected_pid 对齐，更新该账号的数据
+                    matched = next((acc for acc in accounts if acc.get('pid') == selected_pid), None) or accounts[0]
 
                     self.data_manager.update_account_remark(
-                        current_account.get('wxid', ''),
+                        matched.get('wxid', ''),
                         wxid,
                         new_remark
                     )
@@ -2711,11 +2729,7 @@ class WeChatManagerApp(QMainWindow):
         if len(accounts) == 1:
             return accounts[0]['pid']
 
-        try:
-            QMessageBox.information(self, "提示", "未选择具体账号，已默认使用列表中的第一个账号。请双击左侧账号以锁定发送账号。",
-                                    QMessageBox.StandardButton.Ok, QMessageBox.StandardButton.Ok)
-        except Exception:
-            pass
+        # 无需提示，静默使用列表中的第一个账号
         return accounts[0]['pid']
 
     def _handle_send_failure_simple(self, current_pid, target_id, content, is_group=False):
@@ -2729,23 +2743,23 @@ class WeChatManagerApp(QMainWindow):
         except Exception as e:
             print(f"重新发送时出错: {str(e)}")
 
-    def send_message_to_wxid(self, wxid, content):
+    def send_message_to_wxid(self, wxid, content, pid=None):
         try:
-            pid = self._get_wechat_pid()
-            if not pid:
+            current_pid = pid if pid else self._get_wechat_pid()
+            if not current_pid:
                 return False
-            return send_message_to_wxid(pid, wxid, content)
+            return send_message_to_wxid(current_pid, wxid, content)
         except Exception as e:
             QMessageBox.warning(self, "发送失败", f"发送消息时出错: {str(e)}", QMessageBox.StandardButton.Ok, QMessageBox.StandardButton.Ok)
             return False
 
-    def send_image_to_wxid(self, wxid, image_path):
+    def send_image_to_wxid(self, wxid, image_path, pid=None):
         try:
-            pid = self._get_wechat_pid()
-            if not pid:
+            current_pid = pid if pid else self._get_wechat_pid()
+            if not current_pid:
                 return False
 
-            return send_image_to_wxid(pid, wxid, image_path)
+            return send_image_to_wxid(current_pid, wxid, image_path)
         except Exception as e:
             QMessageBox.warning(self, "发送失败", f"发送图片时出错: {str(e)}", QMessageBox.StandardButton.Ok, QMessageBox.StandardButton.Ok)
             return False
@@ -2783,6 +2797,14 @@ class WeChatManagerApp(QMainWindow):
                                       f"确定要添加 {member_nickname} 为好友吗？\nID: {member_wxid}",
                                       QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
+
+                # 设置为群聊成员添加场景（常用为 14）。若未找到则保持默认
+                try:
+                    idx = self.scene_combo.findData("14")
+                    if idx != -1:
+                        self.scene_combo.setCurrentIndex(idx)
+                except Exception:
+                    pass
 
                 self.add_friend()
 
@@ -2824,7 +2846,8 @@ class WeChatManagerApp(QMainWindow):
 
         friend_id = self.friend_id_input.text().strip()
         greeting = self.greeting_input.text().strip()
-        scene = self.scene_combo.currentData()
+        # 防止场景未初始化导致为 None，默认使用 "3"
+        scene = self.scene_combo.currentData() or "3"
 
         if not friend_id:
             QMessageBox.warning(self, "错误", "请输入好友ID或手机号", QMessageBox.StandardButton.Ok, QMessageBox.StandardButton.Ok)
@@ -4766,7 +4789,7 @@ class WeChatManagerApp(QMainWindow):
             print(f"格式化AI回复失败: {e}")
             return response
 
-    def send_delayed_reply(self, receiver_wxid, response, reply_type="ai_reply"):
+    def send_delayed_reply(self, receiver_wxid, response, reply_type="ai_reply", pid=None):
         try:
 
             try:
@@ -4785,18 +4808,22 @@ class WeChatManagerApp(QMainWindow):
 
             print(f"将在 {delay} 秒后发送回复: {response[:50]}...")
             print(f"接收者ID: {receiver_wxid}")
+            if pid:
+                print(f"指定发送账号PID: {pid}")
 
-            QTimer.singleShot(delay * 1000, lambda:
-                             self.send_auto_reply_with_type(receiver_wxid, response, reply_type))
+            QTimer.singleShot(
+                delay * 1000,
+                lambda: self.send_auto_reply_with_type(receiver_wxid, response, reply_type, pid=pid)
+            )
 
         except Exception as e:
             print(f"发送延迟回复失败: {e}")
 
-    def send_auto_reply_with_type(self, receiver_wxid, content, reply_type="auto_reply"):
+    def send_auto_reply_with_type(self, receiver_wxid, content, reply_type="auto_reply", pid=None):
         try:
 
             print(f"正在发送{reply_type}回复消息到 {receiver_wxid}: '{content}'")
-            success = self.send_auto_reply(None, receiver_wxid, content)
+            success = self.send_auto_reply(pid, receiver_wxid, content)
 
             if success:
                 print(f"已成功发送{reply_type}回复消息: '{content}'")
@@ -4847,17 +4874,11 @@ class WeChatManagerApp(QMainWindow):
 
     def send_auto_reply(self, pid, receiver_wxid, content):
         try:
-
-            if not pid:
-
-                wechat_info = SimpleWeChatInfo()
-                accounts = wechat_info.run()
-
-                if not accounts:
-                    print("未找到可用的微信账号，请确保微信已登录")
-                    return False
-
-                pid = accounts[0]['pid']
+            # 统一确定用于发送的账号PID：优先使用调用方传入的pid，否则通过当前选择账号获取
+            current_pid = pid if pid else self._get_wechat_pid()
+            if not current_pid:
+                print("未找到可用的微信账号，请确保微信已登录")
+                return False
 
             if not receiver_wxid or not receiver_wxid.strip():
                 print("接收者ID无效，无法发送消息")
@@ -4876,7 +4897,7 @@ class WeChatManagerApp(QMainWindow):
 
                 if file_extension in image_extensions:
                     print(f"发送图片文件: {file_path}")
-                    success = send_image_to_wxid(pid, receiver_wxid, file_path)
+                    success = send_image_to_wxid(current_pid, receiver_wxid, file_path)
 
                     if success:
                         print(f"已成功发送图片: {file_path}")
@@ -4898,7 +4919,7 @@ class WeChatManagerApp(QMainWindow):
                                     receiver_name = contact.get("nickname", receiver_wxid)
                                     break
 
-                        dialog = SendMessageDialog(receiver_name, self, receiver_wxid)
+                        dialog = SendMessageDialog(receiver_name, self, receiver_wxid, pid=current_pid)
 
                         dialog.image_path_edit.setText(file_path)
 
@@ -4922,10 +4943,10 @@ class WeChatManagerApp(QMainWindow):
             if is_group_message:
                 print(f"发送消息到群聊: {receiver_wxid}，不添加@前缀")
 
-            print(f"准备发送消息 - PID: {pid}, 接收者: {receiver_wxid}, 内容: '{content}'")
+            print(f"准备发送消息 - PID: {current_pid}, 接收者: {receiver_wxid}, 内容: '{content}'")
 
             print(f"正在发送回复消息到 {receiver_wxid}: '{content}'")
-            success = send_message_to_wxid(pid, receiver_wxid, content)
+            success = send_message_to_wxid(current_pid, receiver_wxid, content)
 
             if success:
                 print(f"已成功发送回复消息: '{content}'")
@@ -5558,20 +5579,38 @@ class WeChatManagerApp(QMainWindow):
 
     def start_monitoring(self):
         try:
-
-            wechat_pid = detect_wechat_process()
-            if not wechat_pid:
+            # 获取所有微信进程
+            pids = detect_wechat_processes()
+            if not pids:
                 self.add_friend_status.setText("未找到微信进程，请确保微信已启动")
                 return
 
-            if not self.monitor:
-                self.monitor = ContactInfoMonitor(wechat_pid)
+            # 停止并清理已经不存在的进程监控
+            try:
+                for pid in list(self.contact_monitors.keys()):
+                    if pid not in pids:
+                        mon = self.contact_monitors.pop(pid, None)
+                        if mon and mon.is_active():
+                            try:
+                                mon.stop()
+                            except Exception:
+                                pass
+            except Exception:
+                pass
 
-            if not self.monitor.is_active():
-                self.monitor.set_callback(self.on_contact_info)
-                self.monitor.start()
+            # 为所有在运行的微信进程启动监听
+            started = 0
+            for pid in pids:
+                mon = self.contact_monitors.get(pid)
+                if mon is None:
+                    mon = ContactInfoMonitor(pid)
+                    self.contact_monitors[pid] = mon
+                if not mon.is_active():
+                    mon.set_callback(self.on_contact_info)
+                    mon.start()
+                    started += 1
 
-            self.add_friend_status.setText("监听已启动，等待搜索...")
+            self.add_friend_status.setText(f"监听已启动，共{len(pids)}个微信，新增启动{started}个。等待搜索...")
 
         except Exception as e:
             self.add_friend_status.setText(f"监听启动失败: {str(e)}")
@@ -6458,7 +6497,8 @@ class WeChatManagerApp(QMainWindow):
                             try:
                                 if response:
                                     formatted = self.format_ai_response(response, getattr(ai_assistant, 'auto_reply_settings', {}))
-                                    self.send_delayed_reply(receiver_wxid, formatted, reply_type="ai_reply")
+                                    # 透传当前消息所属账号PID，确保由同一账号发送
+                                    self.send_delayed_reply(receiver_wxid, formatted, reply_type="ai_reply", pid=current_pid)
                             finally:
                                 try:
                                     ai_assistant.response_ready.disconnect(on_ai_response)
